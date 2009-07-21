@@ -19,3 +19,5 @@ kstats.c
 procfs.c
 peb.c
 dlpi.c
+libnetlink.c
+ll_map.c

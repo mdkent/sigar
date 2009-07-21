@@ -1511,7 +1511,187 @@ static void get_interface_type(sigar_net_interface_config_t *ifconfig,
     SIGAR_SSTRCPY(ifconfig->type, type);
 }
 
-#endif
+#include "libnetlink.h"
+#include "ll_map.h"
+
+struct nlmsg_list
+{
+    struct nlmsg_list *next;
+    struct nlmsghdr h;
+};
+
+static int store_nlmsg(const struct sockaddr_nl *who, struct nlmsghdr *n,
+               void *arg)
+{
+    struct nlmsg_list **linfo = (struct nlmsg_list**)arg;
+    struct nlmsg_list *h;
+    struct nlmsg_list **lp;
+
+    h = malloc(n->nlmsg_len+sizeof(void*));
+    if (h == NULL)
+        return -1;
+
+    memcpy(&h->h, n, n->nlmsg_len);
+    h->next = NULL;
+
+    for (lp = linfo; *lp; lp = &(*lp)->next) /* NOTHING */;
+    *lp = h;
+
+    ll_remember_index(who, n, NULL);
+    return 0;
+}
+
+/*
+ * Gather addresses on linux with rtnetlink using libnetlink and liberal
+ * duplication of code from iproute2 ipaddress.c, thanks Alexey Kuznetsov!
+ */
+int sigar_net_interface_config_get(sigar_t *sigar, const char *name,
+                                   sigar_net_interface_config_t *ifconfig)
+{
+    struct rtnl_handle rth = { .fd = -1 };
+    struct nlmsg_list *linfo = NULL;
+    struct nlmsg_list *ainfo = NULL;
+    struct nlmsg_list *l, *n, *a;
+
+    if (!name) {
+        return sigar_net_interface_config_primary_get(sigar, ifconfig);
+    }
+
+    SIGAR_ZERO(ifconfig);
+
+    if (rtnl_open(&rth, 0) < 0) {
+      return -1;
+    }
+
+    SIGAR_SSTRCPY(ifconfig->name, name);
+
+    /* Gather link info */
+    if (rtnl_wilddump_request(&rth, AF_NETLINK, RTM_GETLINK) < 0) {
+        return errno;
+    }
+
+    if (rtnl_dump_filter(&rth, store_nlmsg, &linfo, NULL, NULL) < 0) {
+        fprintf(stderr, "Dump terminated\n");
+    }
+
+    /* Gather address info */
+    if (rtnl_wilddump_request(&rth, AF_NETLINK, RTM_GETADDR) < 0) {
+        fprintf(stderr,"Cannot send dump request");
+    }
+
+    if (rtnl_dump_filter(&rth, store_nlmsg, &ainfo, NULL, NULL) < 0) {
+        fprintf(stderr, "Dump terminated\n");
+    }
+
+    /* Find the interface */
+    for (l=linfo; l; l=n) {
+        n = l->next;
+        struct ifinfomsg *ifi = NLMSG_DATA(&l->h);
+        struct nlmsghdr *n = &l->h;
+        struct rtattr *tb[IFA_MAX+1];
+        const char *label;
+
+        parse_rtattr(tb, IFA_MAX, IFLA_RTA(ifi), IFLA_PAYLOAD(n));
+        label = RTA_DATA(tb[IFA_LABEL]);
+
+        if (!strEQ(label, ifconfig->name)) {
+          free(l);
+          continue;
+        }
+
+        sigar_uint64_t flags = ifi->ifi_flags;
+        int is_mcast = flags & IFF_MULTICAST;
+        int is_slave = flags & IFF_SLAVE;
+        flags &= ~(IFF_MULTICAST|IFF_SLAVE);
+        if (is_mcast) {
+            flags |= SIGAR_IFF_MULTICAST;
+        }
+        if (is_slave) {
+            flags |= SIGAR_IFF_SLAVE;
+        }
+        ifconfig->flags = flags;
+
+        if (ifconfig->flags & IFF_LOOPBACK) {
+            SIGAR_SSTRCPY(ifconfig->type,
+                          SIGAR_NIC_LOOPBACK);
+        } 
+        else {
+            get_interface_type(ifconfig, ifi->ifi_type);
+        }
+
+        if (tb[IFLA_ADDRESS]) {
+            sigar_net_address_mac_set(ifconfig->hwaddr,
+                                      RTA_DATA(tb[IFLA_ADDRESS]),
+                                      IFHWADDRLEN);
+        } 
+        else {
+            sigar_hwaddr_set_null(ifconfig);
+        }
+
+        if (tb[IFLA_MTU]) {
+            ifconfig->mtu = *(int*)RTA_DATA(tb[IFLA_MTU]);
+        }
+
+        /*
+         * Not implemented on linux or in rtnetlink, set to 1 for backwards
+         * compat.
+         */
+        ifconfig->metric = 1;
+
+        /* Right, lets grab the primary ip */
+        for (a=ainfo; a; a=a->next) {
+            struct nlmsghdr *n = &a->h;
+            struct ifaddrmsg *ifa = NLMSG_DATA(n);
+            struct rtattr *tb[IFA_MAX+1];
+
+            if (ifa->ifa_index != ifi->ifi_index) {
+                continue;
+            }
+
+#define rta_s_addr(type) \
+    ((struct in_addr *)RTA_DATA(tb[type]))->s_addr
+
+            parse_rtattr(tb, IFA_MAX, IFA_RTA(ifa), IFA_PAYLOAD(n));
+            if (ifa->ifa_family == AF_INET) {
+                if (tb[IFA_LOCAL]) {
+                    sigar_net_address_set(ifconfig->address,
+                                          rta_s_addr(IFA_LOCAL));
+
+                    /* Has a peer? */ 
+                    if (tb[IFA_ADDRESS] != NULL &&
+                        memcmp(RTA_DATA(tb[IFA_ADDRESS]),
+                               RTA_DATA(tb[IFA_LOCAL]), 4) != 0) 
+                    {
+                        sigar_net_address_set(ifconfig->destination,
+                                              rta_s_addr(IFA_ADDRESS));
+                    }
+                }
+
+                /*
+                 * These are per ip, but assign it to the interface as sigar
+                 * expects.
+                 */
+                if (tb[IFA_BROADCAST]) {
+                    sigar_net_address_set(ifconfig->broadcast,
+                                          rta_s_addr(IFA_BROADCAST));
+                }
+                sigar_net_address_set(ifconfig->netmask,
+                                      htonl(~((1<<(32-ifa->ifa_prefixlen))-1)));
+
+                /* Only getting the primary ip right now */
+                break;
+            }
+        }
+
+        free(l);
+    }
+
+    rtnl_close(&rth);
+
+    return SIGAR_OK;
+}
+
+#else
 
 int sigar_net_interface_config_get(sigar_t *sigar, const char *name,
                                    sigar_net_interface_config_t *ifconfig)
@@ -1644,6 +1824,8 @@ int sigar_net_interface_config_get(sigar_t *sigar, const char *name,
 
     return SIGAR_OK;
 }
+
+#endif
 
 #ifdef _AIX
 #  define MY_SIOCGIFCONF CSIOCGIFCONF
