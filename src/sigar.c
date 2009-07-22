@@ -1552,6 +1552,7 @@ int sigar_net_interface_config_get(sigar_t *sigar, const char *name,
     struct nlmsg_list *linfo = NULL;
     struct nlmsg_list *ainfo = NULL;
     struct nlmsg_list *l, *n, *a;
+    char *ptr, *name_no_alias;
 
     if (!name) {
         return sigar_net_interface_config_primary_get(sigar, ifconfig);
@@ -1560,10 +1561,20 @@ int sigar_net_interface_config_get(sigar_t *sigar, const char *name,
     SIGAR_ZERO(ifconfig);
 
     if (rtnl_open(&rth, 0) < 0) {
-      return -1;
+        return -1;
     }
 
     SIGAR_SSTRCPY(ifconfig->name, name);
+
+    /*
+     * rtnetlink doesn't list aliases as interfaces, rather they are a label on
+     * an ip address 
+     */
+    name_no_alias = sigar_strdup(ifconfig->name);
+
+    if ((ptr = strchr(name_no_alias, ':'))) {
+        *ptr = '\0';  /* wlan0:1 -> wlan0 */
+    }
 
     /* Gather link info */
     if (rtnl_wilddump_request(&rth, AF_NETLINK, RTM_GETLINK) < 0) {
@@ -1594,9 +1605,9 @@ int sigar_net_interface_config_get(sigar_t *sigar, const char *name,
         parse_rtattr(tb, IFA_MAX, IFLA_RTA(ifi), IFLA_PAYLOAD(n));
         label = RTA_DATA(tb[IFA_LABEL]);
 
-        if (!strEQ(label, ifconfig->name)) {
-          free(l);
-          continue;
+        if (!strEQ(label, name_no_alias)) {
+            free(l);
+            continue;
         }
 
         sigar_uint64_t flags = ifi->ifi_flags;
@@ -1644,6 +1655,7 @@ int sigar_net_interface_config_get(sigar_t *sigar, const char *name,
             struct ifaddrmsg *ifa = NLMSG_DATA(n);
             struct rtattr *tb[IFA_MAX+1];
 
+            /* Looking for the addresses attached to our device */
             if (ifa->ifa_index != ifi->ifi_index) {
                 continue;
             }
@@ -1652,6 +1664,14 @@ int sigar_net_interface_config_get(sigar_t *sigar, const char *name,
     ((struct in_addr *)RTA_DATA(tb[type]))->s_addr
 
             parse_rtattr(tb, IFA_MAX, IFA_RTA(ifa), IFA_PAYLOAD(n));
+
+            /* Skip over addresses that don't match our expected device label */
+            if (tb[IFA_LABEL]) {
+                if (!strEQ(ifconfig->name, RTA_DATA(tb[IFA_LABEL]))) {
+                    continue;
+                }
+            }
+
             if (ifa->ifa_family == AF_INET) {
                 if (tb[IFA_LOCAL]) {
                     sigar_net_address_set(ifconfig->address,
@@ -1685,6 +1705,8 @@ int sigar_net_interface_config_get(sigar_t *sigar, const char *name,
 
         free(l);
     }
+
+    free(name_no_alias);
 
     rtnl_close(&rth);
 
